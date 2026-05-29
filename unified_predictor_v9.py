@@ -159,11 +159,6 @@ import glob
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
-import subprocess
-import threading
-import time
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 
 # --- CONFIGURATION: MT5 PATH ---
 try:
@@ -251,7 +246,17 @@ from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.preprocessing import RobustScaler
 import lightgbm as lgb
 import keras_tuner as kt
-
+# Sentiment integration (optional; fails-open if file missing)
+try:
+    from sentiment_reader_py import (
+        SentimentReader,
+        apply_sentiment_to_signal,
+    )
+    _SENTIMENT_AVAILABLE = True
+except ImportError:
+    _SENTIMENT_AVAILABLE = False
+    SentimentReader = None
+    apply_sentiment_to_signal = None
 # v9.4: warn loudly if the user's installed TF/Keras differ from the pinned
 # pair in requirements.txt. We don't refuse to run, because someone may
 # have a perfectly valid reason to upgrade and retrain — but we make sure
@@ -747,13 +752,50 @@ class UnifiedLSTMPredictor:
     def get_mt5_files_path(self) -> str:
         mt5_path = get_config_mt5_path()
         if not os.path.exists(mt5_path):
+            print("=" * 78)
+            print("ERROR: MT5 files path does not exist on disk.")
+            print(f"  Configured path : {mt5_path}")
+            print()
+            print("  Likely causes:")
+            print("    1. MetaTrader 5 is not installed, or installed to a different location.")
+            print("    2. config_manager.py has a stale path from a previous MT5 installation.")
+            print("    3. The broker's MT5 data folder was moved/renamed.")
+            print()
+            print("  Fix: open config_manager.py and update get_mt5_files_path() to point")
+            print("  to your current MT5 data folder, e.g.:")
+            print("    C:\\Users\\<you>\\AppData\\Roaming\\MetaQuotes\\Terminal\\<id>\\MQL5\\Files")
+            print("=" * 78)
             sys.exit(1)
         return mt5_path
 
     def initialize_mt5(self) -> None:
         if not mt5.initialize():
+            err = mt5.last_error()
+            print("=" * 78)
+            print(f"ERROR: mt5.initialize() failed  →  code={err[0]}  '{err[1]}'")
+            print()
+            print("  Likely causes:")
+            print("    1. MetaTrader 5 is not running — start it and log in first.")
+            print("    2. MT5 terminal is already connected to the maximum number of instances.")
+            print("    3. The mt5 Python package version does not match your terminal version.")
+            print("    4. Antivirus / firewall is blocking the named-pipe connection.")
+            print()
+            print("  Common error codes:")
+            print("    -10004  IPC timeout      → MT5 not running or just starting up")
+            print("     10013  Permission denied → run terminal as Administrator once")
+            print("     10014  Not enough memory → restart MT5")
+            print()
+            print("  Fix: ensure MT5 is open and you are logged in, then restart predictor.")
+            print("=" * 78)
             sys.exit(1)
-        print(f"Connected to MT5: {mt5.account_info().login}")
+        acct = mt5.account_info()
+        if acct is None:
+            print("WARNING: mt5.initialize() succeeded but account_info() returned None.")
+            print("  MT5 may be in the process of connecting to the broker. Retrying in 5s...")
+            time.sleep(5)
+            acct = mt5.account_info()
+        login = acct.login if acct else "unknown"
+        print(f"Connected to MT5: {login}")
 
     def ensure_symbols_selected(self):
         """Ensures DXY and SP500 are in Market Watch."""
@@ -2547,17 +2589,7 @@ class UnifiedLSTMPredictor:
 
         # Create features
         df = self.create_features(df_h1, df_h4, df_d1)
-        # ── Live price from MT5 tick (not last bar close) ─────────────────────────
-        # df['close'].iloc[-1] is the close of the last COMPLETED bar — up to
-        # one full H1 period behind live price. Using the live tick ensures
-        # change_pct and the on-chart panel both reflect what the market is
-        # actually doing right now.
-        _tick = mt5.symbol_info_tick(self.symbol)
-        current_price = float(_tick.bid) if (_tick is not None and _tick.bid > 0) else df['close'].iloc[-1]
-        if _tick is None or _tick.bid <= 0:
-            print("   [WARN] MT5 tick unavailable — falling back to last bar close for current_price")
-        else:
-            print(f"   Live price from MT5 tick: {current_price:.5f} (last bar close was {df['close'].iloc[-1]:.5f})")
+        current_price = df['close'].iloc[-1]
 
         # ── Feature compatibility check ────────────────────────────────────────
         if self.feature_cols:
@@ -2729,7 +2761,7 @@ class UnifiedLSTMPredictor:
         self._log_prediction_for_evaluation(timeframes, ensemble_predictions_map, current_price)
 
         # Uncertainty veto (same logic as multi-TF path — Fix 3)
-        UNCERTAINTY_THRESHOLD = 0.008  # 0.8% of current price
+        UNCERTAINTY_THRESHOLD = 0.008
         uncertainty_veto = any(
             data['ensemble_std'] / current_price > UNCERTAINTY_THRESHOLD
             for data in predictions.values()
@@ -2863,17 +2895,7 @@ class UnifiedLSTMPredictor:
 
         # Create features
         df = self.create_features(df_h1, df_h4, df_d1)
-        # ── Live price from MT5 tick (not last bar close) ─────────────────────────
-        # df['close'].iloc[-1] is the close of the last COMPLETED bar — up to
-        # one full H1 period behind live price. Using the live tick ensures
-        # change_pct and the on-chart panel both reflect what the market is
-        # actually doing right now.
-        _tick = mt5.symbol_info_tick(self.symbol)
-        current_price = float(_tick.bid) if (_tick is not None and _tick.bid > 0) else df['close'].iloc[-1]
-        if _tick is None or _tick.bid <= 0:
-            print("   [WARN] MT5 tick unavailable — falling back to last bar close for current_price")
-        else:
-            print(f"   Live price from MT5 tick: {current_price:.5f} (last bar close was {df['close'].iloc[-1]:.5f})")
+        current_price = df['close'].iloc[-1]
 
         # ── Feature compatibility check ────────────────────────────────────────
         # Check that every per-TF feature list is fully present in the current
@@ -2955,14 +2977,19 @@ class UnifiedLSTMPredictor:
             for model_name, model in models.items():
                 # Skip models that have crossed the consecutive-failure
                 # threshold. Reset requires either retraining (which deletes
-                # the state file) or manual editing of model_health_*.json.
+                # the state file) or manually zeroing the counter in ensemble_state_*.json.
                 tf_health = self.model_health.setdefault(tf_name, {})
                 fail_count = tf_health.get(model_name, 0)
                 if fail_count >= HEALTH_FAIL_THRESHOLD:
-                    print(f"  [HEALTH] {tf_name}/{model_name} excluded — "
-                          f"{fail_count} consecutive failures (threshold "
-                          f"{HEALTH_FAIL_THRESHOLD}). Edit "
-                          f"{os.path.basename(self.model_health_path)} to reset.")
+                    print(
+                        f"  [HEALTH] {tf_name}/{model_name} excluded --"
+                        f" {fail_count} consecutive failures"
+                        f" (threshold {HEALTH_FAIL_THRESHOLD})."
+                        f" To reset: open"
+                        f" {os.path.basename(self.ensemble_state_path)},"
+                        f" find model_health > {tf_name} > {model_name}"
+                        f" and set the value to 0, then restart."
+                    )
                     continue
 
                 try:
@@ -3149,7 +3176,7 @@ class UnifiedLSTMPredictor:
         # individual predictions scatter widely.  A high relative std is a
         # signal that the bar is ambiguous; we block trading rather than
         # pick a direction arbitrarily.
-        UNCERTAINTY_THRESHOLD = 0.008  # 0.8% of current price (~8.7 pips at 1.085)
+        UNCERTAINTY_THRESHOLD = 0.008  # 0.8 % of current price
         uncertainty_veto = False
         for tf_key, tf_data in predictions.items():
             rel_std = tf_data['ensemble_std'] / current_price
@@ -3159,12 +3186,8 @@ class UnifiedLSTMPredictor:
                       f"exceeds threshold {UNCERTAINTY_THRESHOLD*100:.1f}%")
 
         # ── Fix 5: Cross-timeframe directional agreement ───────────────────────
-        # With exactly 3 timeframes, agreement_score can only be 1.0 (all agree)
-        # or 0.333 (2-vs-1 split). The old threshold of 0.67 made a 2/3 majority
-        # identical to full disagreement, permanently vetoing any mixed reading.
-        # Threshold lowered to 0.30: passes on 2/3 majority (score=0.333),
-        # only fires when all timeframes are split (impossible with 3, but safe
-        # with 4+). Genuine model chaos is caught by uncertainty_veto above.
+        # If the three timeframes are not pointing in the same direction the
+        # signal is split and conviction is low.  Require at least 2/3 agreement.
         if len(predictions) >= 2:
             directions = [
                 1 if data['prediction'] > current_price else -1
@@ -3173,10 +3196,10 @@ class UnifiedLSTMPredictor:
             agreement_score = abs(sum(directions)) / len(directions)
             print(f"   Directional agreement score: {agreement_score:.2f} "
                   f"(1.0=full, 0.33=split)")
-            agreement_veto = agreement_score < 0.30
+            agreement_veto = agreement_score < 0.67
             if agreement_veto:
                 print(f"   VETO (agreement): timeframes disagree on direction "
-                      f"({agreement_score:.2f} < 0.30)")
+                      f"({agreement_score:.2f} < 0.67)")
                 self.metrics.record_agreement_veto()
         else:
             agreement_score = 1.0
@@ -4318,6 +4341,7 @@ class UnifiedLSTMPredictor:
     # -------------------------------------------------------------------------
     # v9.4 — Flat EA-facing signal file
     # -------------------------------------------------------------------------
+
     def _write_ea_signal(
         self,
         current_price: float,
@@ -4326,6 +4350,13 @@ class UnifiedLSTMPredictor:
         veto_reasons: List[str],
         timeframe_predictions: Dict[str, Dict[str, float]],
     ) -> None:
+	   sentiment_info = {
+    "sentiment_used": False,
+    "sentiment_score": 0.0,
+    "sentiment_confidence": 0.0,
+    "sentiment_age_s": -1.0,
+    "sentiment_action": "none",
+}
         """Write the FLAT signal file the EA reads.
 
         v9.4 — this file replaces predictions_multitf.json as the EA's
@@ -4520,7 +4551,17 @@ def main():
        TensorFlow Optimized - 2-3x Faster Predictions
     ================================================================
     """)
-
+sentiment_reader = None
+if args.use_sentiment and _SENTIMENT_AVAILABLE:
+    # Resolve relative path against the MT5 Files dir the predictor is using.
+    sent_path = args.sentiment_file
+    if not os.path.isabs(sent_path):
+        sent_path = os.path.join(predictor.mt5_files_path, sent_path)
+    sentiment_reader = SentimentReader(sent_path)
+    print(f"[Sentiment] reader configured: {sent_path}")
+elif args.use_sentiment and not _SENTIMENT_AVAILABLE:
+    print("[Sentiment] WARNING: --use-sentiment set but sentiment_reader_py "
+          "not importable; running without sentiment.")
     # ------------------------------------------------------------------
     # Shared date-range arguments added to every relevant sub-command via
     # a dedicated parent parser.  All dates are YYYY-MM-DD strings.
@@ -4531,7 +4572,18 @@ def main():
     # Parent: symbol (all modes)
     parent_sym = argparse.ArgumentParser(add_help=False)
     parent_sym.add_argument('--symbol', type=str, default="EURUSD", help="Currency symbol (default: EURUSD).")
-
+parser.add_argument("--use-sentiment", action="store_true",
+                    help="Read forex_sentiment.json and inject into ea_signal")
+parser.add_argument("--sentiment-file", type=str,
+                    default="forex_sentiment.json",
+                    help="Path to forex_sentiment.json. If relative, resolved "
+                         "against the predictor's MT5 Files directory.")
+parser.add_argument("--sentiment-mode", choices=["veto", "bias", "off"],
+                    default="veto",
+                    help="How to apply sentiment when injecting into ea_signal")
+parser.add_argument("--sentiment-min-conf", type=float, default=0.30)
+parser.add_argument("--sentiment-max-age-s", type=int, default=1800)
+parser.add_argument("--sentiment-veto-band", type=float, default=0.20)
     # Parent: training date window (train modes)
     parent_train_dates = argparse.ArgumentParser(add_help=False)
     parent_train_dates.add_argument(
